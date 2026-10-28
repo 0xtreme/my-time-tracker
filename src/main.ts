@@ -1,41 +1,13 @@
 import "./styles.css";
 
-type TimerMode = "exclusive" | "parallel";
-type Theme = "light" | "dark";
-type CopyMode = "local" | "utc";
-type ProjectPanelView = "active" | "archived";
-
-type Project = {
-  id: string;
-  name: string;
-  createdAt: string;
-  color: string;
-  archived: boolean;
-};
-
-type WorkSession = {
-  id: string;
-  projectId: string;
-  startAt: string;
-  endAt: string | null;
-  note: string;
-};
-
-type Settings = {
-  timerMode: TimerMode;
-  staleAfterMinutes: number;
-  theme: Theme;
-};
-
-type AppState = {
-  schemaVersion: 1;
-  projects: Project[];
-  sessions: WorkSession[];
-  settings: Settings;
-  lastSeenAt: string;
-};
+import type { AppState, Project, WorkSession, TimerMode, CopyMode, ProjectPanelView } from "./types";
+import { authStyles, mountAuth, signOut } from "./cloud-auth";
+import { cloudConfigured, ConflictError, createQueue, message } from "./cloud-sync";
+import { fromRows, normalise, store, toRows, type TrackerRows } from "./cloud";
 
 const STORAGE_KEY = "time-session-tracker:v1";
+// With cloud configured, records live in Supabase; only the per-device heartbeat stays here.
+const LAST_SEEN_KEY = "time-session-tracker:last-seen";
 const HEARTBEAT_MS = 30_000;
 const RUN_LIMIT_MS = 7 * 24 * 60 * 60 * 1000;
 const PROJECT_COLORS = ["#2563eb", "#0f766e", "#9333ea", "#c2410c", "#be123c", "#4d7c0f"];
@@ -48,13 +20,27 @@ if (!appElement) {
 
 const app: HTMLDivElement = appElement;
 
-let state = loadState();
+let state = cloudConfigured ? createInitialState() : loadState();
 let selectedProjectId = "all";
 let projectPanelView: ProjectPanelView = "active";
-let recoveryVisible = shouldShowRecovery(state);
+let recoveryVisible = cloudConfigured ? false : shouldShowRecovery(state);
 let notice = "";
 
-render();
+type SyncState = "loading" | "saved" | "saving" | "error";
+let synced: TrackerRows | null = null;
+let syncState: SyncState = "loading";
+let legacy: AppState | null = null;
+let legacyUploaded = false;
+const queue = createQueue();
+
+if (cloudConfigured) {
+  const style = document.createElement("style");
+  style.textContent = authStyles;
+  document.head.append(style);
+  mountAuth(app, "Session Tracker").then(() => reloadCloud());
+} else {
+  render();
+}
 
 setInterval(() => {
   touchLastSeen();
@@ -71,17 +57,20 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function loadState(): AppState {
+  return parseStored(window.localStorage.getItem(STORAGE_KEY)) ?? createInitialState();
+}
+
+function parseStored(raw: string | null): AppState | null {
   const fallback = createInitialState();
-  const raw = window.localStorage.getItem(STORAGE_KEY);
 
   if (!raw) {
-    return fallback;
+    return null;
   }
 
   try {
     const parsed = JSON.parse(raw) as AppState;
     if (!Array.isArray(parsed.projects) || !Array.isArray(parsed.sessions)) {
-      return fallback;
+      return null;
     }
 
     return {
@@ -96,7 +85,7 @@ function loadState(): AppState {
       lastSeenAt: parsed.lastSeenAt || nowIso(),
     };
   } catch {
-    return fallback;
+    return null;
   }
 }
 
@@ -126,8 +115,111 @@ function saveState(options: { heartbeat?: boolean } = {}) {
     lastSeenAt: options.heartbeat === false ? state.lastSeenAt : nowIso(),
   };
 
+  if (cloudConfigured && !synced) return; // signed out or loading: keep the last real heartbeat
   state = nextState;
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
+  if (!cloudConfigured) {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
+    return;
+  }
+  window.localStorage.setItem(LAST_SEEN_KEY, nextState.lastSeenAt);
+  pushCloud();
+}
+
+// Saves the difference between the last confirmed cloud rows and the current state.
+function pushCloud() {
+  if (!synced) return;
+  const target = toRows(state);
+  queue.run(async () => {
+    if (!synced) return;
+    const { upserts, deletes } = store.diff(synced, target);
+    if (!store.count(upserts) && !Object.values(deletes).some((ids) => ids.length)) return;
+    setSync("saving");
+    try {
+      await store.push(synced, target);
+      synced = target;
+      setSync("saved");
+    } catch (error) {
+      if (error instanceof ConflictError) {
+        await reloadCloud("Changed in another window or device. The latest cloud data is loaded; your last change was not saved.");
+      } else {
+        notice = `Not saved to the cloud: ${message(error)} Your changes are kept in this window and retried on the next change.`;
+        setSync("error");
+        render();
+      }
+    }
+  });
+}
+
+async function reloadCloud(note = "") {
+  queue.reset();
+  synced = null;
+  setSync("loading");
+  try {
+    const rows = await store.load();
+    const lastSeenAt = window.localStorage.getItem(LAST_SEEN_KEY) || nowIso();
+    synced = rows;
+    if (!rows.projects.length && !rows.sessions.length) {
+      // First run in the cloud: start with the default projects, as the local app does.
+      state = { ...createInitialState(), lastSeenAt };
+      pushCloud();
+    } else {
+      state = fromRows(rows, lastSeenAt);
+    }
+    legacy = parseStored(window.localStorage.getItem(STORAGE_KEY));
+    recoveryVisible = shouldShowRecovery(state);
+    notice = note;
+    setSync("saved");
+  } catch (error) {
+    notice = `Could not load your cloud records: ${message(error)}`;
+    setSync("error");
+  }
+  render();
+}
+
+// Records saved in this browser before cloud sync that the cloud does not have yet.
+function legacyMissing() {
+  if (!legacy || !synced) return null;
+  const missing = store.missing(normalise(legacy));
+  return { projects: missing.projects.length, sessions: missing.sessions.length, total: missing.projects.length + missing.sessions.length };
+}
+
+async function uploadLegacy() {
+  if (!legacy) return;
+  const local = normalise(legacy);
+  queue.run(async () => {
+    setSync("saving");
+    try {
+      await store.merge(local);
+      await reloadCloud();
+      legacyUploaded = legacyMissing()?.total === 0;
+      notice = legacyUploaded ? "Browser records uploaded and verified in the cloud." : "Upload finished, but some browser records are still missing from the cloud. The browser copy has been kept.";
+    } catch (error) {
+      notice = `Upload failed: ${message(error)} The browser copy has been kept.`;
+      setSync("error");
+    }
+    render();
+  });
+}
+
+function setSync(next: SyncState) {
+  syncState = next;
+  const element = app.querySelector<HTMLElement>("[data-sync]");
+  if (element) element.textContent = syncLabel();
+}
+
+function syncLabel() {
+  return { loading: "Loading…", saved: "Saved to cloud", saving: "Saving…", error: "Not saved" }[syncState];
+}
+
+function renderCloudBar() {
+  if (!cloudConfigured) return "";
+  const missing = legacyMissing();
+  const banner = legacyUploaded
+    ? `<div class="notice">Upload verified: the cloud holds every record from this browser. <button data-action="cloud-remove-local">Remove browser copy</button></div>`
+    : missing && missing.total
+      ? `<div class="notice">This browser has ${missing.sessions} sessions and ${missing.projects} projects from before cloud sync that are not in the cloud yet. <button data-action="cloud-upload">Upload to cloud</button></div>`
+      : "";
+  return banner;
 }
 
 function touchLastSeen() {
@@ -154,6 +246,7 @@ function render() {
           <span><strong data-week-cutoff>${formatCountdown(msUntilNextWeeklyCutoffUtc())}</strong> to week cutoff</span>
           <span class="${longestActiveRunMs >= RUN_LIMIT_MS ? "is-warning" : ""}"><strong data-longest-run>${activeSessions.length ? formatLongDuration(longestActiveRunMs) : "None"}</strong> active run</span>
           <span><strong data-total-today>${formatDuration(totalToday)}</strong> today</span>
+          ${cloudConfigured ? `<span data-sync>${syncLabel()}</span><button data-action="sign-out">Sign out</button>` : ""}
           <button
             class="theme-toggle"
             data-action="toggle-theme"
@@ -166,6 +259,7 @@ function render() {
       </header>
 
       ${notice ? `<div class="notice">${escapeHtml(notice)}</div>` : ""}
+      ${renderCloudBar()}
       ${renderRunLimitWarning()}
       ${renderRecoveryBanner()}
 
@@ -464,6 +558,21 @@ function handleClick(event: Event) {
   const sessionId = target.dataset.sessionId;
 
   switch (action) {
+    case "cloud-upload":
+      void uploadLegacy();
+      return;
+    case "cloud-remove-local":
+      window.localStorage.removeItem(STORAGE_KEY);
+      legacy = null;
+      legacyUploaded = false;
+      notice = "Browser copy removed.";
+      render();
+      return;
+    case "sign-out":
+      queue.reset();
+      synced = null;
+      void signOut().then(() => location.reload());
+      return;
     case "add-project":
       addProject();
       break;
