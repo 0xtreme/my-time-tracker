@@ -1,7 +1,9 @@
 // Shared cloud persistence for personal apps. Copied into each app as src/cloud-sync.ts;
 // keep the copies identical and change this template first.
 //
-// Each app maps its state to rows per table (`{ id, ...columns }`) and back. This module
+// Each app maps its state to rows per table (`{ id, ...columns }`) and back. Keep the
+// last-saved baseline in that app shape (toRows(fromRows(await load()))), not the raw rows
+// from load(), which carry owner/revision columns and Postgres timestamp formats. This module
 // loads the rows (paged), writes only the differences, checks revisions so concurrent edits
 // surface as conflicts, and merges records still held in a browser by id without overwriting
 // cloud rows. Every table must be secured with core.secure_table (owner-only, MFA required).

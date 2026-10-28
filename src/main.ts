@@ -157,13 +157,15 @@ async function reloadCloud(note = "") {
   try {
     const rows = await store.load();
     const lastSeenAt = window.localStorage.getItem(LAST_SEEN_KEY) || nowIso();
-    synced = rows;
     if (!rows.projects.length && !rows.sessions.length) {
       // First run in the cloud: start with the default projects, as the local app does.
+      synced = rows;
       state = { ...createInitialState(), lastSeenAt };
       pushCloud();
     } else {
       state = fromRows(rows, lastSeenAt);
+      // The baseline is kept in the app's own row shape so unchanged rows compare equal.
+      synced = toRows(state);
     }
     legacy = parseStored(window.localStorage.getItem(STORAGE_KEY));
     recoveryVisible = shouldShowRecovery(state);
