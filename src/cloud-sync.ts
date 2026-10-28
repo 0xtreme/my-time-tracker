@@ -9,8 +9,10 @@
 // cloud rows. Every table must be secured with core.secure_table (owner-only, MFA required).
 import { createClient } from '@supabase/supabase-js';
 
-const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined;
+// import.meta.env is absent when code is bundled outside Vite (e.g. Node tests): browser-only mode.
+const env = (import.meta.env ?? {}) as Record<string, string | undefined>;
+const url = env.VITE_SUPABASE_URL;
+const key = env.VITE_SUPABASE_PUBLISHABLE_KEY;
 export const cloudConfigured = Boolean(url && key);
 export const supabase = cloudConfigured ? createClient(url!, key!) : null;
 
